@@ -18,11 +18,13 @@
  */
 
 /*!
+ *  Copyright (c) 2016 by Contributors
  * \file optimizer_op.cc
  * \brief Optimizer operators
  * \author Junyuan Xie
  */
 #include "./optimizer_op-inl.h"
+#include "./elemwise_op_common.h"
 
 namespace mxnet {
 namespace op {
@@ -32,16 +34,21 @@ DMLC_REGISTER_PARAMETER(SGDMomParam);
 DMLC_REGISTER_PARAMETER(AdamParam);
 DMLC_REGISTER_PARAMETER(RMSPropParam);
 DMLC_REGISTER_PARAMETER(RMSPropAlexParam);
+DMLC_REGISTER_PARAMETER(FtrlParam);
 
 NNVM_REGISTER_OP(sgd_update)
+MXNET_ADD_SPARSE_OP_ALIAS(sgd_update)
 .describe(R"code(Update function for Stochastic Gradient Descent (SDG) optimizer.
 
 It updates the weights using::
 
  weight = weight - learning_rate * gradient
 
-If weight is stored with `row_sparse` storage type,
-only the row slices whose indices appear in grad.indices are updated.
+If weight is of ``row_sparse`` storage type,
+only the row slices whose indices appear in grad.indices are updated::
+
+ for row in gradient.indices:
+     weight[row] = weight[row] - learning_rate * gradient[row]
 
 )code" ADD_FILELINE)
 .set_num_inputs(2)
@@ -49,6 +56,7 @@ only the row slices whose indices appear in grad.indices are updated.
 .set_attr_parser(ParamParser<SGDParam>)
 .set_attr<nnvm::FInferShape>("FInferShape", ElemwiseShape<2, 1>)
 .set_attr<nnvm::FInferType>("FInferType", ElemwiseType<2, 1>)
+.set_attr<FInferStorageType>("FInferStorageType", ElemwiseStorageType<2, 1, false, true, false>)
 .set_attr<FCompute>("FCompute<cpu>", SGDUpdate<cpu>)
 .set_attr<FComputeEx>("FComputeEx<cpu>", SGDUpdateEx<cpu>)
 .add_argument("weight", "NDArray-or-Symbol", "Weight")
@@ -56,6 +64,7 @@ only the row slices whose indices appear in grad.indices are updated.
 .add_arguments(SGDParam::__FIELDS__());
 
 NNVM_REGISTER_OP(sgd_mom_update)
+MXNET_ADD_SPARSE_OP_ALIAS(sgd_mom_update)
 .describe(R"code(Momentum update function for Stochastic Gradient Descent (SDG) optimizer.
 
 Momentum update has better convergence rates on neural networks. Mathematically it looks
@@ -74,8 +83,12 @@ It updates the weights using::
 
 Where the parameter ``momentum`` is the decay rate of momentum estimates at each epoch.
 
-If weights are stored with `row_sparse` storage type,
-only the row slices whose indices appear in grad.indices are updated (for both weight and momentum).
+If weight and momentum are both of ``row_sparse`` storage type,
+only the row slices whose indices appear in grad.indices are updated (for both weight and momentum)::
+
+  for row in gradient.indices:
+      v[row] = momentum[row] * v[row] - learning_rate * gradient[row]
+      weight[row] += v[row]
 
 )code" ADD_FILELINE)
 .set_num_inputs(3)
@@ -83,6 +96,7 @@ only the row slices whose indices appear in grad.indices are updated (for both w
 .set_attr_parser(ParamParser<SGDMomParam>)
 .set_attr<nnvm::FInferShape>("FInferShape", ElemwiseShape<3, 1>)
 .set_attr<nnvm::FInferType>("FInferType", ElemwiseType<3, 1>)
+.set_attr<FInferStorageType>("FInferStorageType", ElemwiseStorageType<3, 1, false, true, false>)
 .set_attr<nnvm::FMutateInputs>("FMutateInputs",
   [](const nnvm::NodeAttrs& attrs) {
     return std::vector<uint32_t>{2};
@@ -130,6 +144,7 @@ NNVM_REGISTER_OP(mp_sgd_mom_update)
 .add_arguments(SGDMomParam::__FIELDS__());
 
 NNVM_REGISTER_OP(adam_update)
+MXNET_ADD_SPARSE_OP_ALIAS(adam_update)
 .describe(R"code(Update function for Adam optimizer. Adam is seen as a generalization
 of AdaGrad.
 
@@ -149,12 +164,21 @@ It updates the weights using::
  v = beta2*v + (1-beta2)*(grad**2)
  w += - learning_rate * m / (sqrt(v) + epsilon)
 
+If w, m and v are all of ``row_sparse`` storage type,
+only the row slices whose indices appear in grad.indices are updated (for w, m and v)::
+
+ for row in grad.indices:
+     m[row] = beta1*m[row] + (1-beta1)*grad[row]
+     v[row] = beta2*v[row] + (1-beta2)*(grad[row]**2)
+     w[row] += - learning_rate * m[row] / (sqrt(v[row]) + epsilon)
+
 )code" ADD_FILELINE)
 .set_num_inputs(4)
 .set_num_outputs(1)
 .set_attr_parser(ParamParser<AdamParam>)
 .set_attr<nnvm::FInferShape>("FInferShape", ElemwiseShape<4, 1>)
 .set_attr<nnvm::FInferType>("FInferType", ElemwiseType<4, 1>)
+.set_attr<FInferStorageType>("FInferStorageType", ElemwiseStorageType<4, 1, false, true, false>)
 .set_attr<nnvm::FMutateInputs>("FMutateInputs",
   [](const nnvm::NodeAttrs& attrs) {
     return std::vector<uint32_t>{2, 3};
@@ -258,6 +282,47 @@ to be 0.9 and the learning rate :math:`\eta` to be 0.0001.
 .add_argument("g", "NDArray-or-Symbol", "g")
 .add_argument("delta", "NDArray-or-Symbol", "delta")
 .add_arguments(RMSPropAlexParam::__FIELDS__());
+
+NNVM_REGISTER_OP(ftrl_update)
+MXNET_ADD_SPARSE_OP_ALIAS(ftrl_update)
+.describe(R"code(Update function for Ftrl optimizer.
+Referenced from *Ad Click Prediction: a View from the Trenches*, available at
+http://dl.acm.org/citation.cfm?id=2488200.
+
+It updates the weights using::
+
+ rescaled_grad = clip(grad * rescale_grad, clip_gradient)
+ z += rescaled_grad - (sqrt(n + rescaled_grad**2) - sqrt(n)) * weight / learning_rate
+ n += rescaled_grad**2
+ w = (sign(z) * lamda1 - z) / ((beta + sqrt(n)) / learning_rate + wd) * (abs(z) > lamda1)
+
+If w, z and n are all of ``row_sparse`` storage type,
+only the row slices whose indices appear in grad.indices are updated (for w, z and n)::
+
+ for row in grad.indices:
+     rescaled_grad[row] = clip(grad[row] * rescale_grad, clip_gradient)
+     z[row] += rescaled_grad[row] - (sqrt(n[row] + rescaled_grad[row]**2) - sqrt(n[row])) * weight[row] / learning_rate
+     n[row] += rescaled_grad[row]**2
+     w[row] = (sign(z[row]) * lamda1 - z[row]) / ((beta + sqrt(n[row])) / learning_rate + wd) * (abs(z[row]) > lamda1)
+
+)code" ADD_FILELINE)
+.set_num_inputs(4)
+.set_num_outputs(1)
+.set_attr_parser(ParamParser<FtrlParam>)
+.set_attr<nnvm::FInferShape>("FInferShape", ElemwiseShape<4, 1>)
+.set_attr<nnvm::FInferType>("FInferType", ElemwiseType<4, 1>)
+.set_attr<FInferStorageType>("FInferStorageType", ElemwiseStorageType<4, 1, false, true, false>)
+.set_attr<nnvm::FMutateInputs>("FMutateInputs",
+  [](const nnvm::NodeAttrs& attrs) {
+    return std::vector<uint32_t>{2, 3};
+  })
+.set_attr<FCompute>("FCompute<cpu>", FtrlUpdate<cpu>)
+.set_attr<FComputeEx>("FComputeEx<cpu>", FtrlUpdateEx<cpu>)
+.add_argument("weight", "NDArray-or-Symbol", "Weight")
+.add_argument("grad", "NDArray-or-Symbol", "Gradient")
+.add_argument("z", "NDArray-or-Symbol", "z")
+.add_argument("n", "NDArray-or-Symbol", "Square of grad")
+.add_arguments(FtrlParam::__FIELDS__());
 
 }  // namespace op
 }  // namespace mxnet

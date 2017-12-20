@@ -18,6 +18,7 @@
  */
 
 /*!
+ *  Copyright (c) 2015 by Contributors
  * \file iter_prefetcher.h
  * \brief define a prefetcher using threaditer to keep k batch fetched
  */
@@ -139,10 +140,10 @@ class PrefetcherIter : public IIterator<DataBatch> {
   PrefetcherParam param_;
   /*! \brief backend thread */
   dmlc::ThreadedIter<DataBatch> iter;
-
- private:
   /*! \brief internal batch loader */
   std::unique_ptr<IIterator<TBlobBatch> > loader_;
+
+ private:
   /*! \brief output data */
   DataBatch *out_;
   /*! \brief queue to be recycled */

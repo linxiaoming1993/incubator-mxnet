@@ -19,12 +19,13 @@
 """ Key value store interface of MXNet for parameter synchronization."""
 from __future__ import absolute_import
 
+from array import array
 import ctypes
 import pickle
 from .ndarray import NDArray
 from .ndarray import _ndarray_cls
-from .base import _LIB
-from .base import check_call, c_array, c_str, string_types, mx_uint, py_str
+from .base import _LIB, c_str_array, c_handle_array, c_array, c_array_buf, c_str
+from .base import check_call, string_types, mx_uint, py_str
 from .base import NDArrayHandle, KVStoreHandle
 from . import optimizer as opt
 
@@ -46,22 +47,32 @@ def _ctype_key_value(keys, vals):
             assert(use_str_keys == str_keys_i), "inconsistent types of keys detected."
         c_keys_arr = c_array(ctypes.c_char_p, c_keys) if use_str_keys \
                      else c_array(ctypes.c_int, c_keys)
-        c_vals_arr = c_array(NDArrayHandle, c_vals)
+        c_vals_arr = c_array(ctypes.c_void_p, c_vals)
         return (c_keys_arr, c_vals_arr, use_str_keys)
 
     assert(isinstance(keys, (int,) + string_types)), \
            "unexpected type for keys: " + str(type(keys))
     use_str_keys = isinstance(keys, string_types)
     if isinstance(vals, NDArray):
-        c_keys = c_array(ctypes.c_char_p, [c_str(keys)]) if use_str_keys \
-                 else c_array(ctypes.c_int, [keys])
-        return (c_keys, c_array(NDArrayHandle, [vals.handle]), use_str_keys)
+        c_keys = c_str_array([keys]) if use_str_keys \
+                 else c_array_buf(ctypes.c_int, array('i', [keys]))
+        return (c_keys, c_handle_array([vals]), use_str_keys)
     else:
         for value in vals:
             assert(isinstance(value, NDArray))
-        c_keys = c_array(ctypes.c_char_p, [c_str(keys)] * len(vals)) if use_str_keys \
-                 else c_array(ctypes.c_int, [keys] * len(vals))
-        return (c_keys, c_array(NDArrayHandle, [value.handle for value in vals]), use_str_keys)
+        c_keys = c_str_array([keys] * len(vals)) if use_str_keys \
+                 else c_array_buf(ctypes.c_int, array('i', [keys] * len(vals)))
+        return (c_keys, c_handle_array(vals), use_str_keys)
+
+def _ctype_dict(param_dict):
+    """
+    Returns ctype arrays for keys and values(converted to strings) in a dictionary
+    """
+    assert(isinstance(param_dict, dict)), \
+        "unexpected type for param_dict: " + str(type(param_dict))
+    c_keys = c_array(ctypes.c_char_p, [c_str(k) for k in param_dict.keys()])
+    c_vals = c_array(ctypes.c_char_p, [c_str(str(v)) for v in param_dict.values()])
+    return (c_keys, c_vals)
 
 def _updater_wrapper(updater):
     """A wrapper for the user-defined handle."""
@@ -104,7 +115,7 @@ class KVStore(object):
         ----------
         key : str, int, or sequence of str or int
             The keys.
-        value : NDArray or sequence of NDArray
+        value : NDArray, RowSparseNDArray or sequence of NDArray or RowSparseNDArray
             Values corresponding to the keys.
 
         Examples
@@ -120,8 +131,15 @@ class KVStore(object):
         [ 2.  2.  2.]]
 
         >>> # init a list of key-value pairs
-        >>> keys = [5, 7, 9]
+        >>> keys = ['5', '7', '9']
         >>> kv.init(keys, [mx.nd.ones(shape)]*len(keys))
+
+        >>> # init a row_sparse value
+        >>> kv.init('4', mx.nd.ones(shape).tostype('row_sparse'))
+        >>> b = mx.nd.sparse.zeros('row_sparse', shape)
+        >>> kv.row_sparse_pull('4', row_ids=mx.nd.array([0, 1]), out=b)
+        >>> print b
+        <RowSparseNDArray 2x3 @cpu(0)>
         """
         ckeys, cvals, use_str_keys = _ctype_key_value(key, value)
         if use_str_keys:
@@ -133,17 +151,20 @@ class KVStore(object):
         """ Pushes a single or a sequence of key-value pairs into the store.
 
         This function returns immediately after adding an operator to the engine.
-        The actual operation is executed asynchronously after all previous `push`
-        and `pull` calls for the same input key(s) are finished.
-        There is no synchronization between workers. One can use ``_barrier()``
-        to sync all workers.
+        The actual operation is executed asynchronously. If there are consecutive
+        pushes to the same key, there is no guarantee on the serialization of pushes.
+        The execution of a push does not guarantee that all previous pushes are
+        finished.
+        There is no synchronization between workers.
+        One can use ``_barrier()`` to sync all workers.
 
         Parameters
         ----------
         key : str, int, or sequence of str or int
             Keys.
 
-        value : NDArray or list of NDArray or list of list of NDArray
+        value : NDArray, RowSparseNDArray, list of NDArray or RowSparseNDArray,
+                or list of list of NDArray or RowSparseNDArray
             Values corresponding to the keys.
 
         priority : int, optional
@@ -171,7 +192,7 @@ class KVStore(object):
 
         >>> # push a list of keys.
         >>> # single device
-        >>> keys = [4, 5, 6]
+        >>> keys = ['4', '5', '6']
         >>> kv.push(keys, [mx.nd.ones(shape)]*len(keys))
         >>> b = [mx.nd.zeros(shape)]*len(keys)
         >>> kv.pull(keys, out=b)
@@ -187,6 +208,15 @@ class KVStore(object):
         >>> print b[1][1].asnumpy()
         [[ 4.  4.  4.]
         [ 4.  4.  4.]]
+
+        >>> # push a row_sparse value
+        >>> b = mx.nd.sparse.zeros('row_sparse', shape)
+        >>> kv.init('10', mx.nd.sparse.zeros('row_sparse', shape))
+        >>> kv.push('10', mx.nd.ones(shape).tostype('row_sparse'))
+        >>> # pull out the value
+        >>> kv.row_sparse_pull('10', row_ids=mx.nd.array([0, 1]), out=b)
+        >>> print b
+        <RowSparseNDArray 2x3 @cpu(0)>
         """
         ckeys, cvals, use_str_keys = _ctype_key_value(key, value)
         if use_str_keys:
@@ -204,12 +234,13 @@ class KVStore(object):
         Subsequent attempts to read from the `out` variable will be blocked until the
         pull operation completes.
 
-        `pull` is executed asynchronously after all previous `push` and `pull` calls
-        for the same input key(s) are finished.
+        `pull` is executed asynchronously after all previous `pull` calls and only
+        the last `push` call for the same input key(s) are finished.
 
-        The returned values are gauranteed to be the latest values in the store.
+        The returned values are guaranteed to be the latest values in the store.
 
-        For row_sparse values, please use `row_sparse_pull` instead.
+        For `RowSparseNDArray` values, this call is ignored,
+        please use ``row_sparse_pull`` instead.
 
         Parameters
         ----------
@@ -242,7 +273,7 @@ class KVStore(object):
 
         >>> # pull a list of key-value pairs.
         >>> # On single device
-        >>> keys = [5, 7, 9]
+        >>> keys = ['5', '7', '9']
         >>> b = [mx.nd.zeros(shape)]*len(keys)
         >>> kv.pull(keys, out=b)
         >>> print b[1].asnumpy()
@@ -266,11 +297,12 @@ class KVStore(object):
                 self.handle, mx_uint(len(ckeys)), ckeys, cvals, ctypes.c_int(priority)))
 
     def row_sparse_pull(self, key, out=None, priority=0, row_ids=None):
-        """ Pulls a single row_sparse value or a sequence of row_sparse values from the store
-         with specified row_ids.
+        """ Pulls a single RowSparseNDArray value or a sequence of RowSparseNDArray values \
+        from the store with specified row_ids.
 
         `row_sparse_pull` is executed asynchronously after all previous
-        `push`/`pull`/`row_sparse_pull` calls for the same input key(s) are finished.
+        `pull`/`row_sparse_pull` calls and the last `push` call for the
+        same input key(s) are finished.
 
         The returned values are guaranteed to be the latest values in the store.
 
@@ -279,7 +311,7 @@ class KVStore(object):
         key : str, int, or sequence of str or int
             Keys.
 
-        out: NDArray or list of NDArray or list of list of NDArray
+        out: RowSparseNDArray or list of RowSparseNDArray or list of list of RowSparseNDArray
             Values corresponding to the keys. The stype is expected to be row_sparse
 
         priority : int, optional
@@ -288,14 +320,14 @@ class KVStore(object):
             other pull actions.
 
         row_ids : NDArray or list of NDArray
-            The row_ids for which to pull for each value. Each row_id is an 1D-NDArray \
+            The row_ids for which to pull for each value. Each row_id is an 1D NDArray \
             whose values don't have to be unique nor sorted.
 
         Examples
         --------
         >>> shape = (3, 3)
         >>> kv.init('3', mx.nd.ones(shape).tostype('row_sparse'))
-        >>> a = mx.nd.zeros(shape, stype='row_sparse')
+        >>> a = mx.nd.sparse.zeros('row_sparse', shape)
         >>> row_ids = mx.nd.array([0, 2], dtype='int64')
         >>> kv.row_sparse_pull('3', out=a, row_ids=row_ids)
         >>> print a.asnumpy()
@@ -328,6 +360,61 @@ class KVStore(object):
             check_call(_LIB.MXKVStorePullRowSparse(
                 self.handle, mx_uint(len(ckeys)), ckeys, cvals, crow_ids, ctypes.c_int(priority)))
 
+    def set_gradient_compression(self, compression_params):
+        """ Specifies type of low-bit quantization for gradient compression \
+         and additional arguments depending on the type of compression being used.
+
+        2bit Gradient Compression takes a positive float `threshold`.
+        The technique works by thresholding values such that positive values in the
+        gradient above threshold will be set to threshold. Negative values whose absolute
+        values are higher than threshold, will be set to the negative of threshold.
+        Values whose absolute values are less than threshold will be set to 0.
+        By doing so, each value in the gradient is in one of three states. 2bits are
+        used to represent these states, and every 16 float values in the original
+        gradient can be represented using one float. This compressed representation
+        can reduce communication costs. The difference between these thresholded values and
+        original values is stored at the sender's end as residual and added to the
+        gradient in the next iteration.
+
+        When kvstore is 'local', gradient compression is used to reduce communication
+        between multiple devices (gpus). Gradient is quantized on each GPU which
+        computed the gradients, then sent to the GPU which merges the gradients. This
+        receiving GPU dequantizes the gradients and merges them. Note that this
+        increases memory usage on each GPU because of the residual array stored.
+
+        When kvstore is 'dist', gradient compression is used to reduce communication
+        from worker to sender. Gradient is quantized on each worker which
+        computed the gradients, then sent to the server which dequantizes
+        this data and merges the gradients from each worker. Note that this
+        increases CPU memory usage on each worker because of the residual array stored.
+        Only worker to server communication is compressed in this setting.
+        If each machine has multiple GPUs, currently this GPU to GPU or GPU to CPU communication
+        is not compressed. Server to worker communication (in the case of pull)
+        is also not compressed.
+
+        To use 2bit compression, we need to specify `type` as `2bit`.
+        Only specifying `type` would use default value for the threshold.
+        To completely specify the arguments for 2bit compression, we would need to pass
+        a dictionary which includes `threshold` like:
+        {'type': '2bit', 'threshold': 0.5}
+
+        Parameters
+        ----------
+        compression_params : dict
+            A dictionary specifying the type and parameters for gradient compression.
+            The key `type` in this dictionary is a
+            required string argument and specifies the type of gradient compression.
+            Currently `type` can be only `2bit`
+            Other keys in this dictionary are optional and specific to the type
+            of gradient compression.
+        """
+        if ('device' in self.type) or ('dist' in self.type):
+            ckeys, cvals = _ctype_dict(compression_params)
+            check_call(_LIB.MXKVStoreSetGradientCompression(self.handle,
+                                                            mx_uint(len(compression_params)),
+                                                            ckeys, cvals))
+        else:
+            raise Exception('Gradient compression is not supported for this type of kvstore')
 
     def set_optimizer(self, optimizer):
         """ Registers an optimizer with the kvstore.
@@ -367,7 +454,7 @@ class KVStore(object):
             # send the optimizer to server
             try:
                 # use ASCII protocol 0, might be slower, but not a big ideal
-                optim_str = pickle.dumps(optimizer, 0)
+                optim_str = py_str(pickle.dumps(optimizer, 0))
             except:
                 raise
             self._send_command_to_servers(0, optim_str)
@@ -413,7 +500,7 @@ class KVStore(object):
         check_call(_LIB.MXKVStoreGetGroupSize(self.handle, ctypes.byref(size)))
         return size.value
 
-    def save_optimizer_states(self, fname):
+    def save_optimizer_states(self, fname, dump_optimizer=False):
         """Saves the optimizer (updater) state to a file. This is often used when checkpointing
         the model during training.
 
@@ -421,10 +508,13 @@ class KVStore(object):
         ----------
         fname : str
             Path to the output states file.
+        dump_optimizer : bool, default False
+            Whether to also save the optimizer itself. This would also save optimizer
+            information such as learning rate and weight decay schedules.
         """
         assert self._updater is not None, "Cannot save states for distributed training"
         with open(fname, 'wb') as fout:
-            fout.write(self._updater.get_states())
+            fout.write(self._updater.get_states(dump_optimizer))
 
     def load_optimizer_states(self, fname):
         """Loads the optimizer (updater) state from the file.
@@ -434,7 +524,7 @@ class KVStore(object):
         fname : str
             Path to input states file.
         """
-        assert self._updater is not None, "Cannot save states for distributed training"
+        assert self._updater is not None, "Cannot load states for distributed training"
         self._updater.set_states(open(fname, 'rb').read())
 
     def _set_updater(self, updater):
@@ -535,7 +625,7 @@ def create(name='local'):
 
     Parameters
     ----------
-    name : {'local', 'device', 'dist_sync', 'dist_device_sync', 'dist_async'}
+    name : {'local', 'device', 'nccl', 'dist_sync', 'dist_device_sync', 'dist_async'}
         The type of KVStore.
     Returns
     -------

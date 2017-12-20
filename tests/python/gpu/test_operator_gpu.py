@@ -21,6 +21,7 @@ import time
 import unittest
 import mxnet as mx
 import numpy as np
+import unittest
 from mxnet.test_utils import check_consistency, set_default_context, assert_almost_equal
 from numpy.testing import assert_allclose
 
@@ -33,7 +34,11 @@ from test_gluon import *
 from test_loss import *
 #from test_rnn import *
 from test_gluon_rnn import *
-from test_sparse_ndarray import test_create_csr, test_create_row_sparse
+from test_sparse_ndarray import test_create_csr, test_create_row_sparse, test_sparse_nd_slice
+from test_sparse_ndarray import test_create_sparse_nd_empty, test_create_sparse_nd_from_sparse
+from test_sparse_ndarray import test_create_sparse_nd_from_dense, test_create_sparse_nd_infer_shape
+from test_sparse_ndarray import test_sparse_nd_check_format, test_sparse_nd_copy
+from test_sparse_ndarray import test_sparse_nd_setitem
 from test_sparse_operator import *
 from test_ndarray import *
 
@@ -985,6 +990,7 @@ def test_embedding_with_type():
     weight_types = [np.float16, np.float32, np.float64]
     test_embedding_helper(data_types, weight_types, 0, 5)
 
+@unittest.skip("test fails intermittently. temporarily disabled till it gets fixed. tracked at https://github.com/apache/incubator-mxnet/issues/8288")
 def test_svmoutput_with_type():
     sym = mx.sym.SVMOutput(name='svmoutput', use_linear=True)
     ctx_list = [{'ctx': mx.gpu(0), 'svmoutput_data': (20, 10), 'type_dict': {'svmoutput_data': np.float64}},
@@ -1358,7 +1364,7 @@ def test_rnn_layer():
 def test_sequence_reverse():
     check_sequence_reverse(mx.gpu(0))
 
-
+@unittest.skip("Test fails intermittently. Temporarily disabled until fixed. Tracked at https://github.com/apache/incubator-mxnet/issues/8211")
 def test_autograd_save_memory():
     x = mx.nd.zeros((128, 512, 512), ctx=mx.gpu(0))
     x.attach_grad()
@@ -1370,10 +1376,10 @@ def test_autograd_save_memory():
     x.backward()
 
 def test_gluon_ctc_consistency():
-    loss = mx.gluon.loss.CTCLoss(padding_mask=0)
+    loss = mx.gluon.loss.CTCLoss()
     data = mx.nd.arange(0, 4, repeat=40, ctx=mx.gpu(0)).reshape((2,20,4)).flip(axis=0)
-    cpu_label = mx.nd.array([[2,1,0,0],[3,2,2,0]], ctx=mx.cpu(0))
-    gpu_label = mx.nd.array([[2,1,0,0],[3,2,2,0]], ctx=mx.gpu(0))
+    cpu_label = mx.nd.array([[2,1,-1,-1],[3,2,2,-1]], ctx=mx.cpu(0))
+    gpu_label = mx.nd.array([[2,1,-1,-1],[3,2,2,-1]], ctx=mx.gpu(0))
 
     cpu_data = data.copy().as_in_context(mx.cpu(0))
     cpu_data.attach_grad()
@@ -1389,6 +1395,70 @@ def test_gluon_ctc_consistency():
 
     assert_almost_equal(cpu_data.grad.asnumpy(), gpu_data.grad.asnumpy(), atol=1e-3, rtol=1e-3)
 
+
+def test_cuda_rtc():
+    source = r'''
+    extern "C" __global__ void axpy(const float *x, float *y, float alpha) {
+        int i = threadIdx.x + blockIdx.x * blockDim.x;
+        y[i] += alpha * x[i];
+    }
+
+    extern "C" __global__ void saxpy(const float *x, float *y, float alpha) {
+        extern __shared__ float smem[];
+        int i = threadIdx.x + blockIdx.x * blockDim.x;
+        smem[threadIdx.x] = x[i];
+        y[i] += alpha * smem[threadIdx.x];
+    }
+    '''
+    module = mx.rtc.CudaModule(source)
+    axpy = module.get_kernel("axpy", "const float *x, float *y, float alpha")
+    x = mx.nd.ones((10,), ctx=mx.gpu(0))
+    y = mx.nd.zeros((10,), ctx=mx.gpu(0))
+    axpy.launch([x, y, 3.0], mx.gpu(0), (1, 1, 1), (10, 1, 1))
+    assert (y.asnumpy() == 3).all()
+
+    saxpy = module.get_kernel("saxpy", "const float *x, float *y, float alpha")
+    saxpy.launch([x, y, 4.0], mx.gpu(0), (1, 1, 1), (10, 1, 1), 10)
+    assert (y.asnumpy() == 7).all()
+
+    saxpy.launch([x, y, 5.0], mx.gpu(0), (2, 1, 1), (5, 1, 1), 5)
+    assert (y.asnumpy() == 12).all()
+
+
+def test_global_norm_clip_multi_device():
+    x1 = mx.nd.ones((3,3), ctx=mx.gpu(0))
+    x2 = mx.nd.ones((4,4), ctx=mx.cpu(0))
+    norm = gluon.utils.clip_global_norm([x1, x2], 1.0)
+    assert norm == 5.0
+    assert_almost_equal(x1.asnumpy(), np.ones((3,3))/5)
+    assert_almost_equal(x2.asnumpy(), np.ones((4,4))/5)
+
+
+def test_cross_device_autograd():
+    x = mx.nd.random.uniform(shape=(10,))
+    x.attach_grad()
+
+    with mx.autograd.record():
+        y = mx.nd.tanh(x)
+        y = y.copyto(mx.gpu(0))
+        y = mx.nd.tanh(y)
+        y = y.copyto(mx.cpu(0))
+        y = mx.nd.tanh(y)
+        y = y.copyto(mx.gpu(0))
+        y = y.copyto(mx.gpu(0))
+
+        y.backward()
+
+    dx = x.grad.asnumpy()
+    x.grad[:] = 0
+
+    with mx.autograd.record():
+        y = x
+        for i in range(3):
+            y = mx.nd.tanh(y)
+        y.backward()
+
+    assert_almost_equal(dx, x.grad.asnumpy())
 
 if __name__ == '__main__':
     import nose
